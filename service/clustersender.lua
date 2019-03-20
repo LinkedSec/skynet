@@ -4,19 +4,74 @@ local socket = require "skynet.socket"
 local cluster = require "skynet.cluster.core"
 local ignoreret = skynet.ignoreret
 
+local config
 local channel
 local session = 1
 
 local command = {}
-local waiting = {}
+local waiting
+local nodename = cluster.nodename()
+
+local function read_response(sock)
+	local sz = socket.header(sock:read(2))
+	local msg = sock:read(sz)
+	return cluster.unpackresponse(msg)	-- session, ok, data, padding
+end
+
+local function wakeup()
+	if waiting then
+		for _, co in ipairs(waiting) do
+			skynet.wakeup(co)
+		end
+		waiting = nil
+	end
+end
+
+local function connect(current_config)
+	if current_config.host == nil then
+		if not current_config.wait then
+			wakeup()
+		end
+		return
+	end
+
+	local c = sc.channel {
+			host = current_config.host,
+			port = tonumber(current_config.port),
+			response = read_response,
+			nodelay = true,
+		}
+	local interval = 100
+	while true do
+		if pcall(c.connect, c, true) then
+			if current_config == config then
+				channel = c
+				wakeup()
+			else
+				-- node change
+				c:close()
+			end
+			return
+		end
+		if current_config.wait then
+			skynet.sleep(interval)	-- wait and retry
+			if interval < 30 * 100 then
+				interval = interval + 100
+			end
+		else
+			wakeup()
+			return
+		end
+	end
+end
 
 local function send_request(addr, msg, sz)
+	local c = channel
 	-- msg is a local pointer, cluster.packrequest will free it
 	local current_session = session
 	local request, new_session, padding = cluster.packrequest(addr, session, msg, sz)
 	session = new_session
 
-	-- node_channel[node] may yield or throw error
 	local tracetag = skynet.tracetag()
 	if tracetag then
 		if tracetag:sub(1,1) ~= "(" then
@@ -26,15 +81,30 @@ local function send_request(addr, msg, sz)
 			tracetag = newtag
 		end
 		skynet.tracelog(tracetag, string.format("cluster %s", node))
-		channel:request(cluster.packtrace(tracetag))
+		c:request(cluster.packtrace(tracetag))
 	end
-	return channel:request(request, current_session, padding)
+	return c:request(request, current_session, padding)
 end
 
 local function wait()
+	if config.down then
+		error "Node is down"
+	end
 	local co = coroutine.running()
-	table.insert(waiting, co)
+	if waiting then
+		table.insert(waiting, co)
+	else
+		waiting = { co }
+	end
+	skynet.fork(connect, config)
 	skynet.wait(co)
+	if channel == nil then
+		if config.down then
+			error "Node is down"
+		else
+			error "Node is absent"
+		end
+	end
 end
 
 function command.req(...)
@@ -67,34 +137,26 @@ function command.push(addr, msg, sz)
 	channel:request(request, nil, padding)
 end
 
-local function read_response(sock)
-	local sz = socket.header(sock:read(2))
-	local msg = sock:read(sz)
-	return cluster.unpackresponse(msg)	-- session, ok, data, padding
-end
-
-function command.changenode(host, port)
-	local c = sc.channel {
-			host = host,
-			port = tonumber(port),
-			response = read_response,
-			nodelay = true,
-		}
-	succ, err = pcall(c.connect, c, true)
-	if channel then
-		channel:close()
-	end
-	if succ then
-		channel = c
-		for k, co in ipairs(waiting) do
-			waiting[k] = nil
-			skynet.wakeup(co)
+function command.changenode(node)
+	if config and node.host == config.host and node.port == config.port and channel then
+		-- only config changes
+		for k,v in pairs(node) do
+			config[k] = v
 		end
-		skynet.ret(skynet.pack(nil))
-	else
-		channel = nil	-- reset channel
-		skynet.response()(false)
+		return
 	end
+
+	config = node
+	if channel then
+		local c = channel
+		-- reset channel
+		channel = nil
+		c:close()
+	end
+	if waiting then
+		skynet.fork(connect, config)
+	end
+	skynet.ret(skynet.pack(nil))
 end
 
 skynet.start(function()
@@ -103,6 +165,3 @@ skynet.start(function()
 		f(...)
 	end)
 end)
-
-
-

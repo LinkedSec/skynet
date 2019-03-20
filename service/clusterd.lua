@@ -1,77 +1,24 @@
 local skynet = require "skynet"
 require "skynet.manager"
-local sc = require "skynet.socketchannel"
-local socket = require "skynet.socket"
 local cluster = require "skynet.cluster.core"
 
 local config_name = skynet.getenv "cluster"
 local node_address = {}
-local node_session = {}
 local node_sender = {}
 local command = {}
 local config = {}
-local nodename = cluster.nodename()
 
-local function read_response(sock)
-	local sz = socket.header(sock:read(2))
-	local msg = sock:read(sz)
-	return cluster.unpackresponse(msg)	-- session, ok, data, padding
-end
-
-local connecting = {}
-
-local function open_channel(t, key)
-	local ct = connecting[key]
-	if ct then
-		local co = coroutine.running()
-		table.insert(ct, co)
-		skynet.wait(co)
-		return assert(ct.channel)
-	end
-	ct = {}
-	connecting[key] = ct
-	local address = node_address[key]
-	if address == nil and not config.nowaiting then
-		local co = coroutine.running()
-		assert(ct.namequery == nil)
-		ct.namequery = co
-		skynet.error("Waiting for cluster node [".. key.."]")
-		skynet.wait(co)
-		address = node_address[key]
-	end
-	local succ, err, c
+local function sender_config(node)
+	local n = { name = node }
+	local address = node_address[node]
 	if address then
-		local host, port = string.match(address, "([^:]+):(.*)$")
-		c = node_sender[key]
-		if c == nil then
-			c = skynet.newservice "clustersender"
-			if node_sender[key] then
-				-- double check
-				skynet.kill(c)
-				c = node_sender[key]
-			else
-				node_sender[key] = c
-			end
-		end
-
-		succ = pcall(skynet.call, c, "lua", "changenode", host, port)
-
-		if succ then
-			t[key] = c
-			ct.channel = c
-		end
+		n.host, n.port = string.match(address, "([^:]+):(.*)$")
 	else
-		err = string.format("cluster node [%s] is %s.", key,  address == false and "down" or "absent")
+		n.down = (address == false)
 	end
-	connecting[key] = nil
-	for _, co in ipairs(ct) do
-		skynet.wakeup(co)
-	end
-	assert(succ, err)
-	return c
+	n.wait = not config.nowaiting
+	return n
 end
-
-local node_channel = setmetatable({}, { __index = open_channel })
 
 local function loadconfig(tmp)
 	if tmp == nil then
@@ -83,32 +30,36 @@ local function loadconfig(tmp)
 			assert(load(source, "@"..config_name, "t", tmp))()
 		end
 	end
+	local change_set = {}
+	local config_change
 	for name,address in pairs(tmp) do
 		if name:sub(1,2) == "__" then
 			name = name:sub(3)
+			if config[name] ~= address then
+				config_change = true
+			end
 			config[name] = address
 			skynet.error(string.format("Config %s = %s", name, address))
 		else
 			assert(address == false or type(address) == "string")
 			if node_address[name] ~= address then
 				-- address changed
-				if rawget(node_channel, name) then
-					node_channel[name] = nil	-- reset connection
-				end
+				table.insert(change_set, name)
 				node_address[name] = address
-			end
-			local ct = connecting[name]
-			if ct and ct.namequery and not config.nowaiting then
-				skynet.error(string.format("Cluster node [%s] resloved : %s", name, address))
-				skynet.wakeup(ct.namequery)
 			end
 		end
 	end
-	if config.nowaiting then
-		-- wakeup all connecting request
-		for name, ct in pairs(connecting) do
-			if ct.namequery then
-				skynet.wakeup(ct.namequery)
+	if config_change then
+		for node, c in pairs(node_sender) do
+			local n = sender_config(node)
+			skynet.call(c, "lua", "changenode" , n)
+		end
+	else
+		for _, node in ipairs(change_set) do
+			local c = node_sender[node]
+			if c then
+				local n = sender_config(node)
+				skynet.call(c, "lua", "changenode" , n)
 			end
 		end
 	end
@@ -130,7 +81,19 @@ function command.listen(source, addr, port)
 end
 
 function command.sender(source, node)
-	skynet.ret(skynet.pack(node_channel[node]))
+	local c = node_sender[node]
+	if c == nil then
+		c = skynet.newservice "clustersender"
+		-- double check
+		if node_sender[node] then
+			skynet.kill(c)
+		else
+			local n = sender_config(node)
+			skynet.call(c, "lua", "changenode" , n)
+			node_sender[node] = c
+		end
+	end
+	skynet.ret(skynet.pack(c))
 end
 
 local proxy = {}
