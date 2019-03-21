@@ -95,8 +95,8 @@ local function wait()
 		table.insert(waiting, co)
 	else
 		waiting = { co }
+		skynet.fork(connect, config)
 	end
-	skynet.fork(connect, config)
 	skynet.wait(co)
 	if channel == nil then
 		if config.down then
@@ -154,7 +154,7 @@ function command.changenode(node)
 		c:close()
 	end
 	if waiting then
-		skynet.fork(connect, config)
+		skynet.fork(connect, node)
 	end
 	skynet.ret(skynet.pack(nil))
 end
